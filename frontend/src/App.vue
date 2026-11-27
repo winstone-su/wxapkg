@@ -41,9 +41,12 @@ const lastOutputDir = ref('')
 const sessionOutputDir = ref('')
 
 const appNameSourceLabels: Record<string, string> = {
+  'wx-share': '分享标题（wxShare）',
   'local-metadata': '本地元数据',
   'package-config': '包内显式配置',
-  'navigation-title': '全局导航标题',
+  'share-card': '分享卡片标题',
+  'poster-brand': '海报品牌名',
+  'navigation-title': '页面导航标题',
   'code-candidate': '代码候选（低置信度）',
 }
 
@@ -53,7 +56,19 @@ function appNameSourceLabel(source?: string): string {
 
 function appNameTooltip(item: WxapkgItem): string {
   if (!item.AppName) {
-    return '未能从本地元数据或包内配置识别名称'
+    return '未能从本地元数据、包内配置或分享标题识别名称'
+  }
+  if (item.AppNameSource === 'wx-share') {
+    return '来源：wxShare 分享标题，开发者在首页/子包中声明的程序名称（最高优先级）'
+  }
+  if (item.AppNameSource === 'share-card') {
+    return '来源：分享卡片标题，即小程序转发时显示的名称'
+  }
+  if (item.AppNameSource === 'poster-brand') {
+    return '来源：分享海报上绘制的品牌名称'
+  }
+  if (item.AppNameSource === 'navigation-title') {
+    return '来源：页面导航标题，可能只是某个功能页的名称'
   }
   if (item.AppNameSource === 'code-candidate') {
     return '来源：代码候选（低置信度），可能是业务变量或厂商标识'

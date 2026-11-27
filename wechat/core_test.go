@@ -224,10 +224,48 @@ func TestAppNameFromConfigUsesGlobalTitle(t *testing.T) {
 	}
 }
 
-func TestAppNameFromConfigDoesNotUsePageTitle(t *testing.T) {
+// Real WeChat packages carry no name in global.window, so the entry page title
+// must be used. This test previously asserted the opposite, which is why name
+// detection never worked against real data.
+func TestAppNameFromConfigUsesEntryPageTitle(t *testing.T) {
 	config := []byte("{\"entryPagePath\":\"pages/index/index.html\",\"page\":{\"pages/index/index.html\":{\"window\":{\"navigationBarTitleText\":\"Entry title\"}}}}")
+	result := appNameFromConfigResult(config)
+	if result.name != "Entry title" {
+		t.Fatalf("entry page title must be used as app name, got %q", result.name)
+	}
+	if result.source != appNameSourceNavigationTitle {
+		t.Fatalf("unexpected app name source %q", result.source)
+	}
+}
+
+// A non-entry page title must not win over the entry page title.
+func TestAppNameFromConfigPrefersEntryPageTitle(t *testing.T) {
+	config := []byte("{\"entryPagePath\":\"pages/index/index.html\",\"page\":{" +
+		"\"pages/index/index.html\":{\"window\":{\"navigationBarTitleText\":\"Real app\"}}," +
+		"\"pages/other/other.html\":{\"window\":{\"navigationBarTitleText\":\"Other page\"}}}}")
+	result := appNameFromConfigResult(config)
+	if result.name != "Real app" {
+		t.Fatalf("unexpected app name %q", result.name)
+	}
+}
+
+// Pages without an entryPagePath still resolve through the repeated-title vote.
+func TestAppNameFromConfigUsesRepeatedPageTitle(t *testing.T) {
+	config := []byte("{\"page\":{" +
+		"\"pages/a/a.html\":{\"window\":{\"navigationBarTitleText\":\"建发统一收银台\"}}," +
+		"\"pages/b/b.html\":{\"window\":{\"navigationBarTitleText\":\"建发统一收银台\"}}," +
+		"\"pages/c/c.html\":{\"window\":{\"navigationBarTitleText\":\"支付\"}}}}")
+	result := appNameFromConfigResult(config)
+	if result.name != "建发统一收银台" {
+		t.Fatalf("unexpected app name %q", result.name)
+	}
+}
+
+// A title that appears only once is indistinguishable from a page label.
+func TestAppNameFromConfigIgnoresSinglePageTitle(t *testing.T) {
+	config := []byte("{\"page\":{\"pages/a/a.html\":{\"window\":{\"navigationBarTitleText\":\"仅出现一次\"}}}}")
 	if got := appNameFromConfig(config); got != "" {
-		t.Fatalf("page title must not be used as app name, got %q", got)
+		t.Fatalf("single page title must not be used as app name, got %q", got)
 	}
 }
 
@@ -404,6 +442,251 @@ func TestScanWxapkgItemIncludesAppName(t *testing.T) {
 	}
 	if items[0].WxId != "wxd6d308853899ff77" {
 		t.Fatalf("wxid was not inferred from path: %q", items[0].WxId)
+	}
+}
+
+func TestAppNameFromGameConfig(t *testing.T) {
+	config := []byte("{\"name\":\"Game app\",\"deviceOrientation\":\"portrait\"}")
+	result := appNameFromGameConfig(config)
+	if result.name != "Game app" {
+		t.Fatalf("unexpected game app name %q", result.name)
+	}
+	if result.source != appNameSourcePackageConfig {
+		t.Fatalf("unexpected game app name source %q", result.source)
+	}
+}
+
+func TestAppNameFromGameConfigRejectsGenericName(t *testing.T) {
+	if got := appNameFromGameConfig([]byte("{\"name\":\"首页\"}")); got.name != "" {
+		t.Fatalf("generic game name must be rejected, got %q", got.name)
+	}
+}
+
+// A regex guess from compiled code must never outrank the structural sources.
+func TestCodeEntryPriorityIsBelowStructuralSources(t *testing.T) {
+	priority, ok := codeEntryPriority("app-service.js")
+	if !ok {
+		t.Fatal("app-service.js must be a code candidate")
+	}
+	if priority <= gameNamePriorityBase {
+		t.Fatalf("code priority %d must rank below game config priority %d", priority, gameNamePriorityBase)
+	}
+	if priority <= 17 {
+		t.Fatalf("code priority %d must rank below structural priorities", priority)
+	}
+}
+
+// A game config name must win over a regex guess from its code.
+func TestAppNameFromPackageDataPrefersGameConfigOverCode(t *testing.T) {
+	gameJSON := []byte("{\"name\":\"Real game\"}")
+	code := []byte("var x={navigationBarTitleText:\"Guess title\"};")
+	var data []byte
+	var files []*WxapkgFileItemStructure
+	appendEntry := func(name string, body []byte) {
+		data = append(data, bytes.Repeat([]byte{0}, 8)...)
+		files = append(files, &WxapkgFileItemStructure{
+			name:   name,
+			offset: uint32(len(data)),
+			size:   uint32(len(body)),
+		})
+		data = append(data, body...)
+	}
+	appendEntry("game.js", code)
+	appendEntry("project.json", gameJSON)
+
+	result := appNameFromPackageDataResult(data, files)
+	if result.name != "Real game" {
+		t.Fatalf("game config must win over code guess, got %q", result.name)
+	}
+}
+
+// A plugin-only directory has no structural name, so its code is still scanned.
+func TestPackageCandidatesIncludesPluginPackage(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "wxd6d308853899ff77")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("create package directory: %v", err)
+	}
+	for _, name := range []string{"__PLUGINCODE__.wxapkg", "__APP__.wxapkg"} {
+		data, _ := testArchive(t, "/a.js", []byte("x"))
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	candidates := packageCandidates(dir)
+	if len(candidates) != 2 {
+		t.Fatalf("expected both packages as candidates, got %v", candidates)
+	}
+	if filepath.Base(candidates[0]) != "__APP__.wxapkg" {
+		t.Fatalf("main package must come first, got %s", candidates[0])
+	}
+}
+
+// The share card title is what users see for the mini program, so it must be
+// preferred over a page navigation title.
+func TestAppNameFromShareTitlesPrefersHomePagePath(t *testing.T) {
+	code := []byte(`i.onShareAppMessage(function(){return {title:"湘潭铺子会员活动",path:"/pages/brand-dynamics/brand-dynamics"}}),` +
+		`l.onShareAppMessage(function(){return {title:"湘潭铺子会员中心",path:"/pages/index/index"}})`)
+	result := appNameFromShareTitles(code)
+	if result.name != "湘潭铺子会员中心" {
+		t.Fatalf("home page share title must win, got %q", result.name)
+	}
+	if result.source != appNameSourceShareCard {
+		t.Fatalf("unexpected share name source %q", result.source)
+	}
+}
+
+// Without a home page path, the first usable share title is kept.
+func TestAppNameFromShareTitlesFallsBackToFirstTitle(t *testing.T) {
+	code := []byte(`{title:"湘潭铺子会员中心",path:"/pages/user/user"}`)
+	result := appNameFromShareTitles(code)
+	if result.name != "湘潭铺子会员中心" || result.source != appNameSourceShareCard {
+		t.Fatalf("unexpected share result: %+v", result)
+	}
+}
+
+// Promotional share copy must not become the program name.
+func TestAppNameFromShareTitlesRejectsPromotionalTitle(t *testing.T) {
+	for _, title := range []string{"限时秒杀", "立即领取", "马上抢购", "点击参与"} {
+		code := []byte(`{title:"` + title + `",path:"/pages/index/index"}`)
+		if got := appNameFromShareTitles(code); got.name != "" {
+			t.Errorf("promotional title %q was accepted as %q", title, got.name)
+		}
+	}
+}
+
+// A share title that is just the wxid must never be used.
+func TestAppNameFromShareTitlesRejectsWxid(t *testing.T) {
+	code := []byte(`{title:"wx38ae5595accae89e",path:"/pages/index/index"}`)
+	if got := appNameFromShareTitles(code); got.name != "" {
+		t.Fatalf("wxid was accepted as app name: %q", got.name)
+	}
+}
+
+func TestAppNameFromShareTitlesRejectsGenericTitle(t *testing.T) {
+	code := []byte(`{title:"首页",path:"/pages/index/index"}`)
+	if got := appNameFromShareTitles(code); got.name != "" {
+		t.Fatalf("generic share title must be rejected, got %q", got.name)
+	}
+}
+
+func TestAppNameFromShareTitlesRequiresPath(t *testing.T) {
+	code := []byte(`{title:"Some title"}`)
+	if got := appNameFromShareTitles(code); got.name != "" {
+		t.Fatalf("title without path must not be used, got %q", got.name)
+	}
+}
+
+// A share title must outrank a page navigation title guess from the same file.
+func TestReadWxapkgAppNamePrefersShareTitleOverNavigationTitle(t *testing.T) {
+	code := []byte(`var a={navigationBarTitleText:"积分卡充值"};` +
+		`x.onShareAppMessage(function(){return {title:"湘潭铺子会员中心",path:"/pages/index/index"}})`)
+	data, _ := testArchive(t, "/app-service.js", code)
+	path := filepath.Join(t.TempDir(), "main.wxapkg")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("write package: %v", err)
+	}
+
+	result, err := readWxapkgAppNameResult(path, "")
+	if err != nil {
+		t.Fatalf("read app name: %v", err)
+	}
+	if result.name != "湘潭铺子会员中心" {
+		t.Fatalf("share title must win over navigation title, got %q", result.name)
+	}
+	if result.source != appNameSourceShareCard {
+		t.Fatalf("unexpected source %q", result.source)
+	}
+}
+
+// The project's own share helper declares the program title directly, so it is
+// the highest priority source.
+func TestAppNameFromWxShare(t *testing.T) {
+	code := []byte(`wxShareConfig:function(){this.wxShare({title:"建发钻石会会员中心"})}`)
+	result := appNameFromWxShare(code, false)
+	if result.name != "建发钻石会会员中心" {
+		t.Fatalf("unexpected wxShare name %q", result.name)
+	}
+	if result.source != appNameSourceWxShare {
+		t.Fatalf("unexpected wxShare source %q", result.source)
+	}
+}
+
+// A home page wxShare title wins over other pages advertising a sub module.
+func TestAppNameFromWxSharePrefersHomePage(t *testing.T) {
+	other := []byte(`wxShareConfig:function(){this.wxShare({title:"建发钻石会会员天地"})}`)
+	home := []byte(`wxShareConfig:function(){this.wxShare({title:"建发钻石会会员中心"})}`)
+
+	if got := appNameFromWxShare(other, isHomeShareEntry("pages/member-world/app-service.js")); got.name != "建发钻石会会员天地" {
+		t.Fatalf("unexpected sub page name %q", got.name)
+	}
+	if got := appNameFromWxShare(home, isHomeShareEntry("pages/index/app-service.js")); got.name != "建发钻石会会员中心" {
+		t.Fatalf("unexpected home page name %q", got.name)
+	}
+}
+
+func TestIsHomeShareEntry(t *testing.T) {
+	home := []string{"pages/index/app-service.js", "pages/home/index.js", "pages/main.js", "/pages/entry/app-service.js"}
+	for _, name := range home {
+		if !isHomeShareEntry(name) {
+			t.Errorf("%q should be a home page entry", name)
+		}
+	}
+	other := []string{"pages/mall/app-service.js", "pages/member-world/app-service.js", "app-service.js"}
+	for _, name := range other {
+		if isHomeShareEntry(name) {
+			t.Errorf("%q should not be a home page entry", name)
+		}
+	}
+}
+
+// A dynamic wxShare title (this.tagName) is not a literal and must be skipped.
+func TestAppNameFromWxShareSkipsDynamicTitle(t *testing.T) {
+	code := []byte(`wxShareConfig:function(){this.wxShare({title:this.tagName,imgUrl:this.shareImage})}`)
+	if got := appNameFromWxShare(code, true); got.name != "" {
+		t.Fatalf("dynamic title must not be used, got %q", got.name)
+	}
+}
+
+// Sub packages must be scanned: the real program title lives in
+// _pages_index_.wxapkg, not in __APP__.wxapkg.
+func TestPackageCandidatesIncludesSubPackages(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "wxd6d308853899ff77")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("create package directory: %v", err)
+	}
+	names := []string{"__APP__.wxapkg", "_pages_index_.wxapkg", "_pages_mall_.wxapkg", "__PLUGINCODE__.wxapkg"}
+	for _, name := range names {
+		data, _ := testArchive(t, "/a.js", []byte("x"))
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	candidates := packageCandidates(dir)
+	if len(candidates) != len(names) {
+		t.Fatalf("expected %d candidates, got %v", len(names), candidates)
+	}
+	if filepath.Base(candidates[0]) != "__APP__.wxapkg" {
+		t.Fatalf("main package must come first, got %s", candidates[0])
+	}
+	if filepath.Base(candidates[1]) != "_pages_index_.wxapkg" {
+		t.Fatalf("home page sub package must come second, got %s", candidates[1])
+	}
+	if filepath.Base(candidates[len(candidates)-1]) != "__PLUGINCODE__.wxapkg" {
+		t.Fatalf("plugin package must come last, got %s", candidates[len(candidates)-1])
+	}
+}
+
+func TestAppNameSourceRankOrdersShareAboveNavigation(t *testing.T) {
+	if appNameSourceRank(appNameSourceWxShare) <= appNameSourceRank(appNameSourceShareCard) {
+		t.Fatal("wxShare must outrank share card")
+	}
+	if appNameSourceRank(appNameSourceShareCard) <= appNameSourceRank(appNameSourceNavigationTitle) {
+		t.Fatal("share card must outrank navigation title")
+	}
+	if appNameSourceRank(appNameSourceNavigationTitle) <= appNameSourceRank(appNameSourceCodeCandidate) {
+		t.Fatal("navigation title must outrank code candidate")
 	}
 }
 
